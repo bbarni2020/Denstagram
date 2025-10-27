@@ -10,6 +10,8 @@ import WebKit
 
 struct InstagramWebView: UIViewRepresentable {
     @Binding var isLoading: Bool
+    @Binding var targetURL: String
+    @Binding var isSignedOut: Bool
     
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -36,9 +38,9 @@ struct InstagramWebView: UIViewRepresentable {
         
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
-        webView.allowsBackForwardNavigationGestures = true
+        webView.allowsBackForwardNavigationGestures = false
         
-        if let url = URL(string: "https://www.instagram.com/direct/inbox/") {
+        if let url = URL(string: targetURL) {
             let request = URLRequest(url: url)
             webView.load(request)
         }
@@ -47,7 +49,61 @@ struct InstagramWebView: UIViewRepresentable {
     }
     
     func updateUIView(_ webView: WKWebView, context: Context) {
-        // Nothing to update for now
+        guard let currentURL = webView.url?.absoluteString else {
+            if let url = URL(string: targetURL) {
+                let request = URLRequest(url: url)
+                webView.load(request)
+            }
+            return
+        }
+        
+        if currentURL.contains("accounts/login") || 
+           currentURL.contains("accounts/logout") ||
+           currentURL.contains("accounts/emailsignup") ||
+           currentURL.contains("challenge") {
+            return
+        }
+        
+        if currentURL == targetURL {
+            return
+        }
+        
+        let normalizedTarget = targetURL.replacingOccurrences(of: "https://www.instagram.com", with: "").lowercased()
+        let normalizedCurrent = currentURL.replacingOccurrences(of: "https://www.instagram.com", with: "").lowercased()
+        
+        if normalizedTarget.isEmpty {
+            return
+        }
+        
+        if normalizedCurrent == normalizedTarget {
+            return
+        }
+        
+        if normalizedCurrent.contains("/direct/") && normalizedTarget.contains("/direct/") {
+            return
+        }
+        
+        if normalizedCurrent.contains("/accounts/activity") && normalizedTarget.contains("/accounts/activity") {
+            return
+        }
+        
+        if (normalizedCurrent.contains("show_notifications=true") && normalizedTarget.contains("show_notifications=true")) ||
+           (normalizedCurrent == "/" && normalizedTarget.contains("show_notifications=true")) {
+            return
+        }
+        
+        if normalizedCurrent.contains("/accounts/edit") && normalizedTarget.contains("/accounts/edit") {
+            return
+        }
+        
+        if normalizedCurrent.contains("/explore/people") && normalizedTarget.contains("/explore/people") {
+            return
+        }
+        
+        if let url = URL(string: targetURL) {
+            let request = URLRequest(url: url)
+            webView.load(request)
+        }
     }
     
     class Coordinator: NSObject, WKNavigationDelegate {
@@ -64,11 +120,58 @@ struct InstagramWebView: UIViewRepresentable {
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             parent.isLoading = false
             
+            if let currentURL = webView.url?.absoluteString {
+                print("✅ Finished loading: \(currentURL)")
+                if currentURL.contains("accounts/login") {
+                    parent.isSignedOut = true
+                } else if currentURL.contains("/direct/") {
+                    parent.isSignedOut = false
+                }
+                
+                if currentURL.contains("show_notifications=true") {
+                    webView.evaluateJavaScript("""
+                        (function() {
+                            document.querySelectorAll('main, article, section').forEach(el => {
+                                if (!el.querySelector('[role="dialog"]') && !el.closest('[role="dialog"]')) {
+                                    el.style.display = 'none';
+                                }
+                            });
+                            
+                            const notifButton = document.querySelector('a[href*="/accounts/activity"]') || 
+                                               document.querySelector('svg[aria-label*="Notifications"]')?.closest('a') ||
+                                               document.querySelector('svg[aria-label*="Értesítések"]')?.closest('a');
+                            if (notifButton) {
+                                notifButton.click();
+                                setTimeout(() => {
+                                    document.body.style.overflow = 'hidden';
+                                }, 100);
+                            }
+                        })();
+                    """) { _, _ in }
+                }
+            }
+            
+            webView.evaluateJavaScript("document.body.innerHTML.length") { result, error in
+                if let length = result as? Int {
+                    print("📄 Page content length: \(length)")
+                }
+            }
+            
             webView.evaluateJavaScript(getHideElementsJS()) { _, error in
                 if let error = error {
                     print("JS injection error: \(error)")
                 }
             }
+        }
+        
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            parent.isLoading = false
+            print("❌ Navigation failed: \(error.localizedDescription)")
+        }
+        
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            parent.isLoading = false
+            print("❌ Provisional navigation failed: \(error.localizedDescription)")
         }
         
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
@@ -80,11 +183,21 @@ struct InstagramWebView: UIViewRepresentable {
             let urlString = url.absoluteString
             let path = url.path
             
+            print("🔍 Navigation request: \(urlString)")
+            
+            if urlString.contains("facebook.com/instagram/login_sync") {
+                print("🚫 Blocked Facebook sync")
+                decisionHandler(.cancel)
+                return
+            }
+            
             if urlString.contains("accounts/login") ||
                urlString.contains("accounts/emailsignup") ||
                urlString.contains("accounts/password") ||
                urlString.contains("challenge") ||
                urlString.contains("accounts/two_factor") {
+                parent.isSignedOut = urlString.contains("accounts/login") || urlString.contains("accounts/logout")
+                print("✅ Allowing auth page")
                 decisionHandler(.allow)
                 return
             }
@@ -95,10 +208,36 @@ struct InstagramWebView: UIViewRepresentable {
                 decisionHandler(.allow)
                 return
             }
+            
+            if path.hasPrefix("/explore/people") ||
+               path.hasPrefix("/explore/search") ||
+               urlString.contains("/explore/tags") {
+                decisionHandler(.allow)
+                return
+            }
 
             if path.contains("accounts/activity") ||
-               urlString.contains("follow") ||
-               urlString.contains("follower") {
+               path.contains("accounts/edit") ||
+               path.hasPrefix("/accounts/") {
+                decisionHandler(.allow)
+                return
+            }
+            
+            if urlString.contains("instagram.com") && 
+               (path.contains("/notifications/") || urlString.contains("/accounts/")) {
+                decisionHandler(.allow)
+                return
+            }
+            
+            if urlString.contains("instagram.com") && path.count > 1 && !path.hasPrefix("/p/") && !path.hasPrefix("/reel/") {
+                let components = path.components(separatedBy: "/").filter { !$0.isEmpty }
+                if components.count == 1 && !components[0].contains(".") {
+                    decisionHandler(.allow)
+                    return
+                }
+            }
+            
+            if path == "/" && navigationAction.navigationType == .other {
                 decisionHandler(.allow)
                 return
             }
@@ -112,6 +251,7 @@ struct InstagramWebView: UIViewRepresentable {
             if urlString.contains("/api/") ||
                urlString.contains("cdninstagram") ||
                urlString.contains("fbcdn") ||
+               urlString.contains("static.cdninstagram") ||
                url.scheme == "blob" ||
                url.scheme == "data" {
                 decisionHandler(.allow)
@@ -121,16 +261,24 @@ struct InstagramWebView: UIViewRepresentable {
             if path == "/" ||
                path.hasPrefix("/explore") ||
                path.hasPrefix("/reels") ||
-               path.hasPrefix("/tv") ||
-               urlString.contains("instagram.com") && !path.hasPrefix("/direct") {
-                if let dmURL = URL(string: "https://www.instagram.com/direct/inbox/") {
-                    webView.load(URLRequest(url: dmURL))
+               path.hasPrefix("/tv") {
+                if urlString.contains("show_notifications=true") {
+                    print("✅ Allowing home for notifications")
+                    decisionHandler(.allow)
+                    return
                 }
-                decisionHandler(.cancel)
-                return
+                
+                if !path.contains("accounts") && !path.contains("notifications") && !parent.isSignedOut {
+                    print("🚫 Blocking feed/explore, redirecting to DMs")
+                    if let dmURL = URL(string: "https://www.instagram.com/direct/inbox/") {
+                        webView.load(URLRequest(url: dmURL))
+                    }
+                    decisionHandler(.cancel)
+                    return
+                }
             }
             
-            if !urlString.contains("instagram.com") && !urlString.contains("facebook.com") {
+            if !urlString.contains("instagram.com") && !urlString.contains("facebook.com") && !urlString.contains("fbcdn") {
                 decisionHandler(.cancel)
                 return
             }
@@ -235,16 +383,75 @@ struct InstagramWebView: UIViewRepresentable {
                     });
                 };
                 
-                // Run immediately
+                const hideBackButton = () => {
+                    const path = window.location.pathname;
+                    
+                    if (path === '/direct/inbox/' || path === '/direct/inbox') {
+                        document.querySelectorAll('svg[aria-label="Back"], button[aria-label="Back"], a[aria-label="Back"]').forEach(el => {
+                            const button = el.closest('button') || el.closest('a');
+                            if (button) {
+                                button.style.display = 'none';
+                            }
+                        });
+                        
+                        document.querySelectorAll('svg').forEach(svg => {
+                            const ariaLabel = svg.getAttribute('aria-label') || '';
+                            if (ariaLabel.toLowerCase().includes('back')) {
+                                const parent = svg.closest('button') || svg.closest('a') || svg.parentElement;
+                                if (parent) {
+                                    parent.style.display = 'none';
+                                }
+                            }
+                        });
+                    } else if (path.startsWith('/direct/t/')) {
+                        document.querySelectorAll('svg[aria-label="Back"], button[aria-label="Back"], a[aria-label="Back"]').forEach(el => {
+                            const button = el.closest('button') || el.closest('a');
+                            if (button) {
+                                button.style.display = '';
+                            }
+                        });
+                        
+                        document.querySelectorAll('svg').forEach(svg => {
+                            const ariaLabel = svg.getAttribute('aria-label') || '';
+                            if (ariaLabel.toLowerCase().includes('back')) {
+                                const parent = svg.closest('button') || svg.closest('a') || svg.parentElement;
+                                if (parent) {
+                                    parent.style.display = '';
+                                }
+                            }
+                        });
+                    }
+                };
+                
+                const hideFeedOnNotifications = () => {
+                    if (window.location.search.includes('show_notifications=true')) {
+                        document.querySelectorAll('main, article, section').forEach(el => {
+                            if (!el.querySelector('[role="dialog"]') && !el.closest('[role="dialog"]')) {
+                                el.style.display = 'none';
+                            }
+                        });
+                        
+                        document.querySelectorAll('[role="main"]').forEach(main => {
+                            const hasDialog = main.querySelector('[role="dialog"]');
+                            if (!hasDialog) {
+                                main.style.display = 'none';
+                            }
+                        });
+                    }
+                };
+                
                 hideNav();
                 blockReelScroll();
                 hideComments();
+                hideBackButton();
+                hideFeedOnNotifications();
                 
-                // Re-run when DOM changes
                 const observer = new MutationObserver(() => {
                     hideNav();
                     blockReelScroll();
                     hideComments();
+                    hideBackButton();
+                    hideFeedOnNotifications();
                 });
                 
                 observer.observe(document.body, {
@@ -261,6 +468,7 @@ struct InstagramWebView: UIViewRepresentable {
                             hideNav();
                             blockReelScroll();
                             hideComments();
+                            hideBackButton();
                         }, 500);
                     }
                 }, 100);
